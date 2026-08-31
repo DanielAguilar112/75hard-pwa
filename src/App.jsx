@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Check, X, Camera, RotateCcw, Droplets, Dumbbell, UtensilsCrossed, BookOpen, ChevronLeft, Download, Share } from "lucide-react";
+import {
+  Check, X, Camera, RotateCcw, Droplets, Dumbbell, UtensilsCrossed, BookOpen,
+  ChevronLeft, Download, Share, History as HistoryIcon, Trophy, Lock,
+} from "lucide-react";
 import { storage } from "./storage";
+import { todayStr, dateForDay, elapsedDay, formatDisplayDate } from "./dateUtils";
 
 const TASKS = [
   { key: "workout1", label: "Workout 1 — 45 min", icon: Dumbbell },
@@ -12,6 +16,12 @@ const TASKS = [
 
 const TOTAL_DAYS = 75;
 const emptyDay = () => ({ workout1: false, workout2: false, diet: false, water: false, reading: false, photo: false });
+
+function makeFreshDays() {
+  const arr = {};
+  for (let i = 1; i <= TOTAL_DAYS; i++) arr[i] = emptyDay();
+  return arr;
+}
 
 function isIos() {
   return /iphone|ipad|ipod/.test(window.navigator.userAgent.toLowerCase());
@@ -56,33 +66,126 @@ function isDayComplete(day) {
   return TASKS.every((t) => day[t.key]) && day.photo;
 }
 
+function consecutiveStreak(days) {
+  let streak = 0;
+  for (let i = 1; i <= TOTAL_DAYS; i++) {
+    if (isDayComplete(days[i])) streak++;
+    else break;
+  }
+  return streak;
+}
+
 export default function App() {
-  const [days, setDays] = useState(() => {
-    const arr = {};
-    for (let i = 1; i <= TOTAL_DAYS; i++) arr[i] = emptyDay();
-    return arr;
-  });
+  const [days, setDays] = useState(makeFreshDays);
   const [photos, setPhotos] = useState({});
   const [startDate, setStartDate] = useState(null);
+  const [history, setHistory] = useState([]);
   const [selectedDay, setSelectedDay] = useState(null);
+  const [view, setView] = useState("main"); // main | history | historyDetail
+  const [selectedAttempt, setSelectedAttempt] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [toast, setToast] = useState("");
+  const [resetNotice, setResetNotice] = useState(null);
   const [installPrompt, setInstallPrompt] = useState(null);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
   const fileInputRef = useRef(null);
 
+  const persistState = useCallback(async (nextDays, nextStart) => {
+    await storage.setState({ days: nextDays, startDate: nextStart });
+  }, []);
+
+  const persistPhotos = useCallback(async (nextPhotos) => {
+    const ok = await storage.setPhotos(nextPhotos);
+    if (!ok) {
+      setToast("Photo storage is full on this device");
+      setTimeout(() => setToast(""), 2500);
+    }
+  }, []);
+
+  const persistHistory = useCallback(async (nextHistory) => {
+    const ok = await storage.setHistory(nextHistory);
+    if (!ok) {
+      setToast("Couldn't save history — storage is full");
+      setTimeout(() => setToast(""), 2500);
+    }
+  }, []);
+
+  // Archive current attempt into history, then reset the board.
+  const archiveAndReset = useCallback(
+    async (currentDays, currentPhotos, currentStart, currentHistory, { completed, failedDay }) => {
+      const streakReached = consecutiveStreak(currentDays);
+      const endDate = completed
+        ? dateForDay(currentStart, TOTAL_DAYS)
+        : dateForDay(currentStart, failedDay);
+      const entry = {
+        id: Date.now(),
+        attemptNumber: currentHistory.length + 1,
+        startDate: currentStart,
+        endDate,
+        daysCompleted: streakReached,
+        completed: !!completed,
+        days: currentDays,
+        photos: currentPhotos,
+      };
+      const nextHistory = [...currentHistory, entry];
+      const freshDays = makeFreshDays();
+      const today = todayStr();
+
+      setHistory(nextHistory);
+      setDays(freshDays);
+      setPhotos({});
+      setStartDate(today);
+
+      await persistHistory(nextHistory);
+      await persistState(freshDays, today);
+      await persistPhotos({});
+
+      return { nextHistory, freshDays, today };
+    },
+    [persistHistory, persistState, persistPhotos]
+  );
+
   useEffect(() => {
     (async () => {
       const state = await storage.getState();
+      let loadedDays = makeFreshDays();
+      let loadedStart = null;
       if (state) {
-        setDays((prev) => ({ ...prev, ...state.days }));
-        setStartDate(state.startDate || null);
+        loadedDays = { ...loadedDays, ...state.days };
+        loadedStart = state.startDate || null;
       }
-      const p = await storage.getPhotos();
-      if (p) setPhotos(p);
+      const p = (await storage.getPhotos()) || {};
+      const h = (await storage.getHistory()) || [];
+
+      if (!loadedStart) {
+        loadedStart = todayStr();
+        await persistState(loadedDays, loadedStart);
+      }
+
+      // Check whether any past day was left incomplete — if so, the
+      // attempt failed and needs to be archived + reset.
+      const elapsed = elapsedDay(loadedStart);
+      let failedDay = null;
+      for (let i = 1; i <= Math.min(elapsed - 1, TOTAL_DAYS); i++) {
+        if (!isDayComplete(loadedDays[i])) {
+          failedDay = i;
+          break;
+        }
+      }
+
+      if (failedDay) {
+        await archiveAndReset(loadedDays, p, loadedStart, h, { failedDay });
+        setResetNotice(`Day ${failedDay} wasn't finished — that attempt (${failedDay - 1} days) was archived. Starting over at Day 1.`);
+      } else {
+        setDays(loadedDays);
+        setPhotos(p);
+        setStartDate(loadedStart);
+        setHistory(h);
+      }
       setLoaded(true);
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -113,39 +216,10 @@ export default function App() {
     }
   };
 
-  const persistState = useCallback(async (nextDays, nextStart) => {
-    await storage.setState({ days: nextDays, startDate: nextStart });
-  }, []);
-
-  const persistPhotos = useCallback(async (nextPhotos) => {
-    const ok = await storage.setPhotos(nextPhotos);
-    if (!ok) {
-      setToast("Photo storage is full on this device");
-      setTimeout(() => setToast(""), 2500);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!startDate && loaded) {
-      const today = new Date().toISOString().slice(0, 10);
-      setStartDate(today);
-      persistState(days, today);
-    }
-  }, [loaded, startDate, days, persistState]);
-
-  let streak = 0;
-  for (let i = 1; i <= TOTAL_DAYS; i++) {
-    if (isDayComplete(days[i])) streak++;
-    else break;
-  }
-  let firstBrokenDay = null;
-  for (let i = 1; i <= TOTAL_DAYS; i++) {
-    if (!isDayComplete(days[i])) {
-      firstBrokenDay = i;
-      break;
-    }
-  }
-  const activeDay = firstBrokenDay || TOTAL_DAYS;
+  const streak = consecutiveStreak(days);
+  const elapsed = startDate ? elapsedDay(startDate) : 1;
+  const activeDay = Math.min(Math.max(elapsed, 1), TOTAL_DAYS);
+  const challengeComplete = elapsed > TOTAL_DAYS && streak === TOTAL_DAYS;
 
   const toggleTask = (dayNum, key) => {
     setDays((prev) => {
@@ -189,17 +263,8 @@ export default function App() {
     });
   };
 
-  const doReset = async () => {
-    const fresh = {};
-    for (let i = 1; i <= TOTAL_DAYS; i++) fresh[i] = emptyDay();
-    setDays(fresh);
-    setPhotos({});
-    const today = new Date().toISOString().slice(0, 10);
-    setStartDate(today);
-    await persistState(fresh, today);
-    await persistPhotos({});
-    setConfirmReset(false);
-    setSelectedDay(null);
+  const startNewAfterCompletion = async () => {
+    await archiveAndReset(days, photos, startDate, history, { completed: true });
   };
 
   if (!loaded) {
@@ -210,9 +275,99 @@ export default function App() {
     );
   }
 
+  // ---------- History list ----------
+  if (view === "history") {
+    return (
+      <div style={styles.app}>
+        <div style={styles.detailHeader}>
+          <button onClick={() => setView("main")} style={styles.backBtn}>
+            <ChevronLeft size={18} strokeWidth={2.5} />
+            <span>BACK</span>
+          </button>
+          <div style={{ fontFamily: FONT.mono, color: COLORS.muted, fontSize: 12, letterSpacing: 1 }}>
+            PAST ATTEMPTS
+          </div>
+        </div>
+        {history.length === 0 ? (
+          <div style={{ color: COLORS.muted, fontFamily: FONT.body, fontSize: 14, marginTop: 20 }}>
+            No past attempts yet. Your first run is the one in progress.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {[...history].reverse().map((a) => (
+              <button
+                key={a.id}
+                onClick={() => {
+                  setSelectedAttempt(a);
+                  setView("historyDetail");
+                }}
+                style={styles.historyCard}
+              >
+                <div>
+                  <div style={styles.historyCardTitle}>
+                    ATTEMPT #{a.attemptNumber}
+                    {a.completed && <Trophy size={14} color={COLORS.accent2} style={{ marginLeft: 6, verticalAlign: "-2px" }} />}
+                  </div>
+                  <div style={styles.historyCardDates}>
+                    {formatDisplayDate(a.startDate)} – {formatDisplayDate(a.endDate)}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div
+                    style={{
+                      ...styles.historyCardDays,
+                      color: a.completed ? COLORS.accent2 : COLORS.text,
+                    }}
+                  >
+                    {a.daysCompleted}/{TOTAL_DAYS}
+                  </div>
+                  <div style={styles.historyCardLabel}>{a.completed ? "COMPLETE" : "DAYS"}</div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ---------- History detail (photo grid) ----------
+  if (view === "historyDetail" && selectedAttempt) {
+    const a = selectedAttempt;
+    const dayNums = Object.keys(a.photos || {}).map(Number).sort((x, y) => x - y);
+    return (
+      <div style={styles.app}>
+        <div style={styles.detailHeader}>
+          <button onClick={() => setView("history")} style={styles.backBtn}>
+            <ChevronLeft size={18} strokeWidth={2.5} />
+            <span>ALL ATTEMPTS</span>
+          </button>
+        </div>
+        <h1 style={styles.dayTitle}>ATTEMPT #{a.attemptNumber}</h1>
+        <div style={{ color: COLORS.muted, fontFamily: FONT.mono, fontSize: 12, marginTop: 6, marginBottom: 20 }}>
+          {formatDisplayDate(a.startDate)} – {formatDisplayDate(a.endDate)} · {a.daysCompleted}/{TOTAL_DAYS} days
+        </div>
+        {dayNums.length === 0 ? (
+          <div style={{ color: COLORS.muted, fontSize: 13 }}>No photos saved for this attempt.</div>
+        ) : (
+          <div style={styles.photoGrid}>
+            {dayNums.map((n) => (
+              <div key={n} style={styles.photoGridItem}>
+                <img src={a.photos[n]} alt={`Day ${n}`} style={styles.photoGridImg} />
+                <div style={styles.photoGridLabel}>D{n}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ---------- Day detail ----------
   if (selectedDay) {
     const day = days[selectedDay];
     const complete = isDayComplete(day);
+    const dateLabel = startDate ? formatDisplayDate(dateForDay(startDate, selectedDay)) : "";
     return (
       <div style={styles.app}>
         <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} />
@@ -222,7 +377,7 @@ export default function App() {
             <span>ALL DAYS</span>
           </button>
           <div style={{ fontFamily: FONT.mono, color: COLORS.muted, fontSize: 12, letterSpacing: 1 }}>
-            {String(selectedDay).padStart(2, "0")} / {TOTAL_DAYS}
+            {String(selectedDay).padStart(2, "0")} / {TOTAL_DAYS} · {dateLabel}
           </div>
         </div>
 
@@ -284,9 +439,29 @@ export default function App() {
     );
   }
 
+  // ---------- Main grid ----------
   return (
     <div style={styles.app}>
       <input ref={fileInputRef} type="file" accept="image/*" onChange={handleFile} style={{ display: "none" }} />
+
+      {resetNotice && (
+        <div style={styles.resetBanner}>
+          <span style={{ fontSize: 12.5, color: COLORS.text, lineHeight: 1.4 }}>{resetNotice}</span>
+          <button onClick={() => setResetNotice(null)} style={styles.installDismiss}>
+            <X size={14} color={COLORS.muted} />
+          </button>
+        </div>
+      )}
+
+      {challengeComplete && (
+        <div style={styles.completeBanner}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <Trophy size={18} color={COLORS.accent2} />
+            <span style={{ fontSize: 13, color: COLORS.text, fontWeight: 600 }}>75 Hard complete. All 75 days locked in.</span>
+          </div>
+          <button onClick={startNewAfterCompletion} style={styles.installBtn}>NEW ATTEMPT</button>
+        </div>
+      )}
 
       {showInstallBanner && (
         <div style={styles.installBanner}>
@@ -314,9 +489,14 @@ export default function App() {
           <div style={styles.eyebrow}>NO EXCUSES · NO SUBSTITUTIONS</div>
           <h1 style={styles.title}>75 HARD</h1>
         </div>
-        <div style={styles.streakBox}>
-          <div style={styles.streakNum}>{String(streak).padStart(2, "0")}</div>
-          <div style={styles.streakLabel}>STREAK</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setView("history")} style={styles.historyBtn}>
+            <HistoryIcon size={18} color={COLORS.muted} strokeWidth={1.75} />
+          </button>
+          <div style={styles.streakBox}>
+            <div style={styles.streakNum}>{String(streak).padStart(2, "0")}</div>
+            <div style={styles.streakLabel}>STREAK</div>
+          </div>
         </div>
       </div>
 
@@ -324,28 +504,32 @@ export default function App() {
         <div style={{ ...styles.progressFill, width: `${(streak / TOTAL_DAYS) * 100}%` }} />
       </div>
       <div style={styles.progressText}>
-        {streak} of {TOTAL_DAYS} days complete
+        {streak} of {TOTAL_DAYS} days complete · Day {activeDay} of {TOTAL_DAYS} today
       </div>
 
       <div style={styles.grid}>
         {Array.from({ length: TOTAL_DAYS }, (_, i) => i + 1).map((n) => {
           const day = days[n];
           const complete = isDayComplete(day);
-          const isActive = n === activeDay;
+          const isActive = n === activeDay && !challengeComplete;
+          const isFuture = n > activeDay;
           const anyProgress = TASKS.some((t) => day[t.key]) || day.photo;
           return (
             <button
               key={n}
-              onClick={() => setSelectedDay(n)}
+              onClick={() => !isFuture && setSelectedDay(n)}
+              disabled={isFuture}
               style={{
                 ...styles.cell,
                 background: complete ? COLORS.accent : "transparent",
                 borderColor: isActive ? COLORS.accent2 : anyProgress ? COLORS.muted : COLORS.line,
                 borderWidth: isActive ? 2 : 1,
                 color: complete ? "#16171A" : isActive ? COLORS.accent2 : COLORS.muted,
+                opacity: isFuture ? 0.35 : 1,
+                cursor: isFuture ? "default" : "pointer",
               }}
             >
-              {complete ? <Check size={14} strokeWidth={3} /> : n}
+              {complete ? <Check size={14} strokeWidth={3} /> : isFuture ? <Lock size={11} strokeWidth={2} /> : n}
             </button>
           );
         })}
@@ -359,9 +543,17 @@ export default function App() {
           </button>
         ) : (
           <div style={styles.confirmBox}>
-            <span style={{ color: COLORS.text, fontSize: 13 }}>Wipe all progress and start over at Day 1?</span>
+            <span style={{ color: COLORS.text, fontSize: 13 }}>Wipe current progress and start over at Day 1? This attempt will be saved to history.</span>
             <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={doReset} style={styles.confirmYes}>YES, RESET</button>
+              <button
+                onClick={async () => {
+                  await archiveAndReset(days, photos, startDate, history, { failedDay: activeDay });
+                  setConfirmReset(false);
+                }}
+                style={styles.confirmYes}
+              >
+                YES, RESET
+              </button>
               <button onClick={() => setConfirmReset(false)} style={styles.confirmNo}>CANCEL</button>
             </div>
           </div>
@@ -410,6 +602,28 @@ const styles = {
     padding: "10px 12px",
     marginBottom: 16,
   },
+  resetBanner: {
+    display: "flex",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 10,
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.accent}`,
+    borderRadius: 6,
+    padding: "10px 12px",
+    marginBottom: 16,
+  },
+  completeBanner: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.accent2}`,
+    borderRadius: 6,
+    padding: "10px 12px",
+    marginBottom: 16,
+  },
   installBtn: {
     background: COLORS.accent2,
     border: "none",
@@ -421,6 +635,7 @@ const styles = {
     fontWeight: 600,
     padding: "6px 10px",
     cursor: "pointer",
+    whiteSpace: "nowrap",
   },
   installDismiss: {
     background: "transparent",
@@ -428,6 +643,7 @@ const styles = {
     cursor: "pointer",
     padding: 4,
     display: "flex",
+    flexShrink: 0,
   },
   header: {
     display: "flex",
@@ -449,6 +665,16 @@ const styles = {
     letterSpacing: 1,
     color: COLORS.text,
     margin: 0,
+  },
+  historyBtn: {
+    background: "transparent",
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 4,
+    padding: "10px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
   },
   streakBox: {
     textAlign: "right",
@@ -505,7 +731,6 @@ const styles = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    cursor: "pointer",
     transition: "all 0.15s ease",
   },
   footer: {
@@ -696,5 +921,68 @@ const styles = {
     border: `1.5px dashed ${COLORS.line}`,
     borderRadius: 6,
     cursor: "pointer",
+  },
+  historyCard: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "14px 14px",
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 6,
+    cursor: "pointer",
+    textAlign: "left",
+  },
+  historyCardTitle: {
+    fontFamily: FONT.mono,
+    fontSize: 12,
+    letterSpacing: 1,
+    color: COLORS.text,
+  },
+  historyCardDates: {
+    fontFamily: FONT.body,
+    fontSize: 12,
+    color: COLORS.muted,
+    marginTop: 4,
+  },
+  historyCardDays: {
+    fontFamily: FONT.display,
+    fontSize: 20,
+    fontWeight: 700,
+  },
+  historyCardLabel: {
+    fontFamily: FONT.mono,
+    fontSize: 9,
+    letterSpacing: 1,
+    color: COLORS.muted,
+    marginTop: 2,
+  },
+  photoGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 1fr)",
+    gap: 8,
+  },
+  photoGridItem: {
+    position: "relative",
+    borderRadius: 6,
+    overflow: "hidden",
+    border: `1px solid ${COLORS.line}`,
+  },
+  photoGridImg: {
+    width: "100%",
+    aspectRatio: "1",
+    objectFit: "cover",
+    display: "block",
+  },
+  photoGridLabel: {
+    position: "absolute",
+    bottom: 4,
+    right: 4,
+    background: "rgba(22,23,26,0.75)",
+    color: COLORS.text,
+    fontFamily: FONT.mono,
+    fontSize: 9,
+    padding: "2px 5px",
+    borderRadius: 3,
   },
 };

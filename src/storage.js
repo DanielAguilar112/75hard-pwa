@@ -36,8 +36,11 @@ export const storage = {
   setState: (value) => safeSet('challenge-state', value),
   getPhotos: () => safeGet('challenge-photos'),
   setPhotos: (value) => safeSet('challenge-photos', value),
+  getHistory: () => safeGet('challenge-history'),
+  setHistory: (value) => safeSet('challenge-history', value),
   clearAll: async () => {
     await safeDel('challenge-state');
     await safeDel('challenge-photos');
+    await safeDel('challenge-history');
   },
 };
