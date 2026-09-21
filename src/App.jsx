@@ -11,32 +11,52 @@ import {
   scheduleReminders, clearScheduledReminders,
 } from "./notifications";
 
-const TASKS = [
-  { key: "workout1", label: "Workout 1 — 45 min", icon: Dumbbell },
-  { key: "workout2", label: "Workout 2 — 45 min, outdoors", icon: Dumbbell },
-  { key: "diet", label: "Diet — zero cheats, zero alcohol", icon: UtensilsCrossed },
-  { key: "reading", label: "10 pages, non-fiction", icon: BookOpen },
-];
-
 const TOTAL_DAYS = 75;
-const WATER_GOAL_OZ = 128;
-const WATER_MAX_OZ = 256;
+const HARD_WATER_GOAL_ML = 3785; // 1 gallon
+const SOFT_WATER_GOAL_ML = 3000; // 3 liters
+const ML_PER_OZ = 29.5735;
+const WATER_MAX_ML = 6000;
 const NOTIF_PREF_KEY = "notif-pref-enabled";
 
-const emptyDay = () => ({ workout1: false, workout2: false, diet: false, waterOz: 0, reading: false, photo: false, weight: null });
+const HARD_WATER_BUTTONS = [
+  { icon: Minus, label: "8oz", deltaMl: -237 },
+  { icon: Plus, label: "8oz", deltaMl: 237 },
+  { icon: Plus, label: "16oz", deltaMl: 473 },
+  { icon: Plus, label: "32oz", deltaMl: 946 },
+];
+const SOFT_WATER_BUTTONS = [
+  { icon: Minus, label: "250ml", deltaMl: -250 },
+  { icon: Plus, label: "250ml", deltaMl: 250 },
+  { icon: Plus, label: "500ml", deltaMl: 500 },
+  { icon: Plus, label: "1L", deltaMl: 1000 },
+];
+
+const emptyDay = () => ({
+  workout1: false,
+  workout2: false,
+  diet: false,
+  dietCheat: false,
+  waterMl: 0,
+  reading: false,
+  photo: false,
+  weight: null,
+});
 
 function normalizeDay(raw) {
   if (!raw) return emptyDay();
-  const waterOz = typeof raw.waterOz === "number" ? raw.waterOz : raw.water ? WATER_GOAL_OZ : 0;
-  const weight = typeof raw.weight === "number" ? raw.weight : null;
+  let waterMl;
+  if (typeof raw.waterMl === "number") waterMl = raw.waterMl;
+  else if (typeof raw.waterOz === "number") waterMl = Math.round(raw.waterOz * ML_PER_OZ);
+  else waterMl = raw.water ? HARD_WATER_GOAL_ML : 0;
   return {
     workout1: !!raw.workout1,
     workout2: !!raw.workout2,
     diet: !!raw.diet,
+    dietCheat: !!raw.dietCheat,
     reading: !!raw.reading,
     photo: !!raw.photo,
-    waterOz,
-    weight,
+    weight: typeof raw.weight === "number" ? raw.weight : null,
+    waterMl,
   };
 }
 
@@ -84,32 +104,64 @@ function compressImage(file) {
   });
 }
 
-function isDayComplete(day) {
-  if (!day) return false;
-  return TASKS.every((t) => day[t.key]) && (day.waterOz || 0) >= WATER_GOAL_OZ && day.photo;
+function weekOf(dayNum) {
+  return Math.ceil(dayNum / 7);
 }
 
-function consecutiveStreak(days) {
+function cheatsUsedInWeek(days, dayNum) {
+  const week = weekOf(dayNum);
+  const start = (week - 1) * 7 + 1;
+  const end = Math.min(week * 7, TOTAL_DAYS);
+  let count = 0;
+  for (let i = start; i <= end; i++) if (days[i]?.dietCheat) count++;
+  return count;
+}
+
+// Hard: diet must simply be logged as on-plan every day, no cheats.
+// Soft: on-plan is always fine; a cheat day is only fine if it's the
+// sole cheat logged in that 7-day block.
+function isDietOk(days, dayNum, mode) {
+  const day = days[dayNum];
+  if (!day) return false;
+  if (mode !== "soft") return !!day.diet;
+  if (!day.diet) return false;
+  if (!day.dietCheat) return true;
+  return cheatsUsedInWeek(days, dayNum) === 1;
+}
+
+function isDayComplete(days, dayNum, mode) {
+  const day = days[dayNum];
+  if (!day) return false;
+  const waterGoal = mode === "soft" ? SOFT_WATER_GOAL_ML : HARD_WATER_GOAL_ML;
+  const waterOk = (day.waterMl || 0) >= waterGoal;
+  const dietOk = isDietOk(days, dayNum, mode);
+  if (mode === "soft") {
+    return day.workout1 && day.reading && dietOk && waterOk && day.photo;
+  }
+  return day.workout1 && day.workout2 && dietOk && waterOk && day.photo;
+}
+
+function consecutiveStreak(days, mode) {
   let streak = 0;
   for (let i = 1; i <= TOTAL_DAYS; i++) {
-    if (isDayComplete(days[i])) streak++;
+    if (isDayComplete(days, i, mode)) streak++;
     else break;
   }
   return streak;
 }
 
-function backwardStreak(days, uptoDay) {
+function backwardStreak(days, uptoDay, mode) {
   let count = 0;
   for (let i = Math.min(uptoDay, TOTAL_DAYS); i >= 1; i--) {
-    if (isDayComplete(days[i])) count++;
+    if (isDayComplete(days, i, mode)) count++;
     else break;
   }
   return count;
 }
 
-function totalCompletedCount(days) {
+function totalCompletedCount(days, mode) {
   let count = 0;
-  for (let i = 1; i <= TOTAL_DAYS; i++) if (isDayComplete(days[i])) count++;
+  for (let i = 1; i <= TOTAL_DAYS; i++) if (isDayComplete(days, i, mode)) count++;
   return count;
 }
 
@@ -157,6 +209,7 @@ export default function App() {
   const fileInputRef = useRef(null);
   const daysRef = useRef(days);
   const activeDayRef = useRef(1);
+  const modeRef = useRef(mode);
 
   const showToast = (msg, ms = 2500) => {
     setToast(msg);
@@ -182,8 +235,8 @@ export default function App() {
   // full 75-day span (used for natural period-end, success or not).
   const archiveAndReset = useCallback(
     async (currentDays, currentPhotos, currentStart, currentHistory, currentMode, { completed, endDayOverride }) => {
-      const streakReached = consecutiveStreak(currentDays);
-      const totalDone = totalCompletedCount(currentDays);
+      const streakReached = consecutiveStreak(currentDays, currentMode);
+      const totalDone = totalCompletedCount(currentDays, currentMode);
       const endDate = endDayOverride
         ? dateForDay(currentStart, endDayOverride)
         : dateForDay(currentStart, TOTAL_DAYS);
@@ -264,7 +317,7 @@ export default function App() {
       if (loadedMode === "hard") {
         const elapsed = elapsedDay(loadedStart);
         for (let i = 1; i <= Math.min(elapsed - 1, TOTAL_DAYS); i++) {
-          if (!isDayComplete(loadedDays[i])) {
+          if (!isDayComplete(loadedDays, i, loadedMode)) {
             failedDay = i;
             break;
           }
@@ -317,10 +370,10 @@ export default function App() {
     }
   };
 
-  const totalDone = totalCompletedCount(days);
+  const totalDone = totalCompletedCount(days, mode);
   const elapsed = startDate ? elapsedDay(startDate) : 1;
   const activeDay = Math.min(Math.max(elapsed, 1), TOTAL_DAYS);
-  const displayStreak = mode === "soft" ? backwardStreak(days, activeDay) : consecutiveStreak(days);
+  const displayStreak = mode === "soft" ? backwardStreak(days, activeDay, mode) : consecutiveStreak(days, mode);
   const periodEnded = elapsed > TOTAL_DAYS;
   const success = mode === "soft" ? totalDone === TOTAL_DAYS : displayStreak === TOTAL_DAYS;
   const weightTrend = getWeightTrend(days, activeDay);
@@ -331,6 +384,9 @@ export default function App() {
   useEffect(() => {
     activeDayRef.current = activeDay;
   }, [activeDay]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
 
   // Keep local reminders scheduled for the rest of today whenever enabled,
   // and reschedule when the app comes back into view (timers don't survive
@@ -339,7 +395,10 @@ export default function App() {
     if (!loaded) return;
     const doSchedule = () => {
       if (notifEnabled && getPermissionState() === "granted") {
-        scheduleReminders(() => isDayComplete(daysRef.current[activeDayRef.current]), activeDayRef.current);
+        scheduleReminders(
+          () => isDayComplete(daysRef.current, activeDayRef.current, modeRef.current),
+          activeDayRef.current
+        );
       }
     };
     doSchedule();
@@ -385,7 +444,11 @@ export default function App() {
     const next = mode === "hard" ? "soft" : "hard";
     setMode(next);
     await persistState(days, startDate, next);
-    showToast(next === "hard" ? "Switched to Hard — a missed day now resets you" : "Switched to Soft — missed days won't reset your progress");
+    showToast(
+      next === "hard"
+        ? "Switched to Hard — 2 workouts, zero cheats, 1 gallon, and a missed day resets you"
+        : "Switched to Soft — 1 workout, 3L water, 1 cheat meal/week, no resets"
+    );
   };
 
   const toggleTask = (dayNum, key) => {
@@ -396,11 +459,39 @@ export default function App() {
     });
   };
 
-  const adjustWater = (dayNum, delta) => {
+  const setDiet = (dayNum, choice) => {
     setDays((prev) => {
-      const cur = prev[dayNum].waterOz || 0;
-      const nextVal = Math.max(0, Math.min(WATER_MAX_OZ, cur + delta));
-      const next = { ...prev, [dayNum]: { ...prev[dayNum], waterOz: nextVal } };
+      const cur = prev[dayNum];
+      let nextDiet = cur.diet;
+      let nextCheat = cur.dietCheat;
+      if (choice === "plan") {
+        if (cur.diet && !cur.dietCheat) {
+          nextDiet = false;
+          nextCheat = false;
+        } else {
+          nextDiet = true;
+          nextCheat = false;
+        }
+      } else if (choice === "cheat") {
+        if (cur.dietCheat) {
+          nextDiet = false;
+          nextCheat = false;
+        } else {
+          nextDiet = true;
+          nextCheat = true;
+        }
+      }
+      const next = { ...prev, [dayNum]: { ...cur, diet: nextDiet, dietCheat: nextCheat } };
+      persistState(next, startDate, mode);
+      return next;
+    });
+  };
+
+  const adjustWater = (dayNum, deltaMl) => {
+    setDays((prev) => {
+      const cur = prev[dayNum].waterMl || 0;
+      const nextVal = Math.max(0, Math.min(WATER_MAX_ML, cur + deltaMl));
+      const next = { ...prev, [dayNum]: { ...prev[dayNum], waterMl: nextVal } };
       persistState(next, startDate, mode);
       return next;
     });
@@ -471,11 +562,17 @@ export default function App() {
         <div style={{ display: "flex", flexDirection: "column", gap: 14, marginTop: 28, flex: 1, justifyContent: "center" }}>
           <button onClick={() => chooseMode("hard")} style={styles.modeCard}>
             <div style={styles.modeCardTitle}>HARD</div>
-            <div style={styles.modeCardDesc}>Miss any task on any day and the board resets to Day 1. No exceptions — the original rule.</div>
+            <div style={styles.modeCardDesc}>
+              2 workouts a day (one outdoors), zero cheats, 1 gallon of water, 10 pages, a photo. Miss one task
+              and the board resets to Day 1. No exceptions.
+            </div>
           </button>
           <button onClick={() => chooseMode("soft")} style={styles.modeCard}>
             <div style={styles.modeCardTitle}>SOFT</div>
-            <div style={styles.modeCardDesc}>Missed days just stay incomplete. Your progress is never wiped — track at your own pace.</div>
+            <div style={styles.modeCardDesc}>
+              1 workout a day, 3 liters of water, one cheat meal allowed per week, 10 pages, a photo. Missed
+              days just stay incomplete — nothing ever resets.
+            </div>
           </button>
         </div>
         <div style={{ fontFamily: FONT.mono, fontSize: 10, color: COLORS.muted, letterSpacing: 1, marginTop: 12 }}>
@@ -651,11 +748,20 @@ export default function App() {
   // ---------- Day detail ----------
   if (selectedDay) {
     const day = days[selectedDay];
-    const complete = isDayComplete(day);
+    const complete = isDayComplete(days, selectedDay, mode);
     const dateLabel = startDate ? formatDisplayDate(dateForDay(startDate, selectedDay)) : "";
-    const waterOz = day.waterOz || 0;
-    const waterPct = Math.min(100, Math.round((waterOz / WATER_GOAL_OZ) * 100));
-    const waterDone = waterOz >= WATER_GOAL_OZ;
+    const waterGoalMl = mode === "soft" ? SOFT_WATER_GOAL_ML : HARD_WATER_GOAL_ML;
+    const waterMl = day.waterMl || 0;
+    const waterPct = Math.min(100, Math.round((waterMl / waterGoalMl) * 100));
+    const waterDone = waterMl >= waterGoalMl;
+    const waterButtons = mode === "soft" ? SOFT_WATER_BUTTONS : HARD_WATER_BUTTONS;
+    const waterDisplay =
+      mode === "soft"
+        ? `${(waterMl / 1000).toFixed(1)} / 3.0 L`
+        : `${Math.round(waterMl / ML_PER_OZ)} / 128 oz`;
+    const cheatsThisWeek = cheatsUsedInWeek(days, selectedDay);
+    const dietOk = isDietOk(days, selectedDay, mode);
+
     return (
       <div style={styles.app}>
         <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} />
@@ -683,76 +789,133 @@ export default function App() {
           </div>
 
           <div style={styles.taskList}>
-            {TASKS.slice(0, 3).map((t) => {
-              const Icon = t.icon;
-              const checked = day[t.key];
-              return (
-                <button key={t.key} onClick={() => toggleTask(selectedDay, t.key)} style={styles.taskRow}>
-                  <div
+            {/* Workout(s) */}
+            <button onClick={() => toggleTask(selectedDay, "workout1")} style={styles.taskRow}>
+              <div
+                style={{
+                  ...styles.taskCheck,
+                  background: day.workout1 ? COLORS.accent : "transparent",
+                  borderColor: day.workout1 ? COLORS.accent : COLORS.line,
+                }}
+              >
+                {day.workout1 && <Check size={14} color="#16171A" strokeWidth={3} />}
+              </div>
+              <Dumbbell size={18} color={day.workout1 ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+              <span style={{ ...styles.taskLabel, color: day.workout1 ? COLORS.text : COLORS.muted }}>
+                {mode === "soft" ? "Workout — 45 min" : "Workout 1 — 45 min"}
+              </span>
+            </button>
+
+            {mode === "hard" && (
+              <button onClick={() => toggleTask(selectedDay, "workout2")} style={styles.taskRow}>
+                <div
+                  style={{
+                    ...styles.taskCheck,
+                    background: day.workout2 ? COLORS.accent : "transparent",
+                    borderColor: day.workout2 ? COLORS.accent : COLORS.line,
+                  }}
+                >
+                  {day.workout2 && <Check size={14} color="#16171A" strokeWidth={3} />}
+                </div>
+                <Dumbbell size={18} color={day.workout2 ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+                <span style={{ ...styles.taskLabel, color: day.workout2 ? COLORS.text : COLORS.muted }}>
+                  Workout 2 — 45 min, outdoors
+                </span>
+              </button>
+            )}
+
+            {/* Diet */}
+            {mode === "hard" ? (
+              <button onClick={() => toggleTask(selectedDay, "diet")} style={styles.taskRow}>
+                <div
+                  style={{
+                    ...styles.taskCheck,
+                    background: day.diet ? COLORS.accent : "transparent",
+                    borderColor: day.diet ? COLORS.accent : COLORS.line,
+                  }}
+                >
+                  {day.diet && <Check size={14} color="#16171A" strokeWidth={3} />}
+                </div>
+                <UtensilsCrossed size={18} color={day.diet ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+                <span style={{ ...styles.taskLabel, color: day.diet ? COLORS.text : COLORS.muted }}>
+                  Diet — zero cheats, zero alcohol
+                </span>
+              </button>
+            ) : (
+              <div style={styles.waterCard}>
+                <div style={styles.waterHeader}>
+                  <UtensilsCrossed size={18} color={dietOk ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+                  <span style={{ ...styles.taskLabel, color: dietOk ? COLORS.text : COLORS.muted, flex: 1 }}>Diet</span>
+                  <span style={{ ...styles.waterValue, color: cheatsThisWeek > 1 ? COLORS.accent : COLORS.muted }}>
+                    {cheatsThisWeek}/1 cheat this week
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    onClick={() => setDiet(selectedDay, "plan")}
                     style={{
-                      ...styles.taskCheck,
-                      background: checked ? COLORS.accent : "transparent",
-                      borderColor: checked ? COLORS.accent : COLORS.line,
+                      ...styles.dietChoiceBtn,
+                      background: day.diet && !day.dietCheat ? COLORS.accent : "transparent",
+                      borderColor: day.diet && !day.dietCheat ? COLORS.accent : COLORS.line,
+                      color: day.diet && !day.dietCheat ? "#16171A" : COLORS.text,
                     }}
                   >
-                    {checked && <Check size={14} color="#16171A" strokeWidth={3} />}
-                  </div>
-                  <Icon size={18} color={checked ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
-                  <span style={{ ...styles.taskLabel, color: checked ? COLORS.text : COLORS.muted }}>{t.label}</span>
-                </button>
-              );
-            })}
+                    ON PLAN
+                  </button>
+                  <button
+                    onClick={() => setDiet(selectedDay, "cheat")}
+                    style={{
+                      ...styles.dietChoiceBtn,
+                      background: day.dietCheat ? COLORS.accent2 : "transparent",
+                      borderColor: day.dietCheat ? COLORS.accent2 : COLORS.line,
+                      color: day.dietCheat ? "#16171A" : COLORS.text,
+                    }}
+                  >
+                    CHEAT MEAL
+                  </button>
+                </div>
+              </div>
+            )}
 
+            {/* Water */}
             <div style={styles.waterCard}>
               <div style={styles.waterHeader}>
                 <Droplets size={18} color={waterDone ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
                 <span style={{ ...styles.taskLabel, color: waterDone ? COLORS.text : COLORS.muted, flex: 1 }}>Water</span>
-                <span style={styles.waterValue}>
-                  {waterOz} / {WATER_GOAL_OZ} oz
-                </span>
+                <span style={styles.waterValue}>{waterDisplay}</span>
               </div>
               <div style={styles.waterBarTrack}>
                 <div style={{ ...styles.waterBarFill, width: `${waterPct}%`, background: waterDone ? COLORS.accent : COLORS.accent2 }} />
               </div>
               <div style={styles.waterButtons}>
-                <button onClick={() => adjustWater(selectedDay, -8)} style={styles.waterBtn}>
-                  <Minus size={12} strokeWidth={2.5} />
-                  <span>8oz</span>
-                </button>
-                <button onClick={() => adjustWater(selectedDay, 8)} style={styles.waterBtn}>
-                  <Plus size={12} strokeWidth={2.5} />
-                  <span>8oz</span>
-                </button>
-                <button onClick={() => adjustWater(selectedDay, 16)} style={styles.waterBtn}>
-                  <Plus size={12} strokeWidth={2.5} />
-                  <span>16oz</span>
-                </button>
-                <button onClick={() => adjustWater(selectedDay, 32)} style={styles.waterBtn}>
-                  <Plus size={12} strokeWidth={2.5} />
-                  <span>32oz</span>
-                </button>
+                {waterButtons.map((b, idx) => {
+                  const Icon = b.icon;
+                  return (
+                    <button key={idx} onClick={() => adjustWater(selectedDay, b.deltaMl)} style={styles.waterBtn}>
+                      <Icon size={12} strokeWidth={2.5} />
+                      <span>{b.label}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
-            {TASKS.slice(3).map((t) => {
-              const Icon = t.icon;
-              const checked = day[t.key];
-              return (
-                <button key={t.key} onClick={() => toggleTask(selectedDay, t.key)} style={styles.taskRow}>
-                  <div
-                    style={{
-                      ...styles.taskCheck,
-                      background: checked ? COLORS.accent : "transparent",
-                      borderColor: checked ? COLORS.accent : COLORS.line,
-                    }}
-                  >
-                    {checked && <Check size={14} color="#16171A" strokeWidth={3} />}
-                  </div>
-                  <Icon size={18} color={checked ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
-                  <span style={{ ...styles.taskLabel, color: checked ? COLORS.text : COLORS.muted }}>{t.label}</span>
-                </button>
-              );
-            })}
+            {/* Reading */}
+            <button onClick={() => toggleTask(selectedDay, "reading")} style={styles.taskRow}>
+              <div
+                style={{
+                  ...styles.taskCheck,
+                  background: day.reading ? COLORS.accent : "transparent",
+                  borderColor: day.reading ? COLORS.accent : COLORS.line,
+                }}
+              >
+                {day.reading && <Check size={14} color="#16171A" strokeWidth={3} />}
+              </div>
+              <BookOpen size={18} color={day.reading ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+              <span style={{ ...styles.taskLabel, color: day.reading ? COLORS.text : COLORS.muted }}>
+                {mode === "soft" ? "10 pages, any book" : "10 pages, non-fiction"}
+              </span>
+            </button>
           </div>
 
           <div style={styles.weightSection}>
@@ -880,10 +1043,11 @@ export default function App() {
       <div style={styles.grid}>
         {Array.from({ length: TOTAL_DAYS }, (_, i) => i + 1).map((n) => {
           const day = days[n];
-          const complete = isDayComplete(day);
+          const complete = isDayComplete(days, n, mode);
           const isActive = n === activeDay && !periodEnded;
           const isFuture = n > activeDay;
-          const anyProgress = TASKS.some((t) => day[t.key]) || day.photo || (day.waterOz || 0) > 0;
+          const anyProgress =
+            day.workout1 || (mode === "hard" && day.workout2) || day.diet || (day.waterMl || 0) > 0 || day.reading || day.photo;
           return (
             <button
               key={n}
@@ -1331,6 +1495,17 @@ const styles = {
     color: COLORS.text,
     fontFamily: FONT.mono,
     fontSize: 10,
+    cursor: "pointer",
+  },
+  dietChoiceBtn: {
+    flex: 1,
+    padding: "10px 4px",
+    border: "1.5px solid",
+    borderRadius: 4,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1,
+    fontWeight: 600,
     cursor: "pointer",
   },
   weightSection: {
