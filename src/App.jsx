@@ -2,20 +2,43 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Check, X, Camera, RotateCcw, Droplets, Dumbbell, UtensilsCrossed, BookOpen,
   ChevronLeft, Download, Share, History as HistoryIcon, Trophy, Lock,
+  Bell, BellOff, Images, Minus, Plus,
 } from "lucide-react";
 import { storage } from "./storage";
 import { todayStr, dateForDay, elapsedDay, formatDisplayDate } from "./dateUtils";
+import {
+  notificationsSupported, getPermissionState, requestPermission,
+  scheduleReminders, clearScheduledReminders,
+} from "./notifications";
 
 const TASKS = [
   { key: "workout1", label: "Workout 1 — 45 min", icon: Dumbbell },
   { key: "workout2", label: "Workout 2 — 45 min, outdoors", icon: Dumbbell },
   { key: "diet", label: "Diet — zero cheats, zero alcohol", icon: UtensilsCrossed },
-  { key: "water", label: "1 gallon of water", icon: Droplets },
   { key: "reading", label: "10 pages, non-fiction", icon: BookOpen },
 ];
 
 const TOTAL_DAYS = 75;
-const emptyDay = () => ({ workout1: false, workout2: false, diet: false, water: false, reading: false, photo: false });
+const WATER_GOAL_OZ = 128;
+const WATER_MAX_OZ = 256;
+const NOTIF_PREF_KEY = "notif-pref-enabled";
+
+const emptyDay = () => ({ workout1: false, workout2: false, diet: false, waterOz: 0, reading: false, photo: false, weight: null });
+
+function normalizeDay(raw) {
+  if (!raw) return emptyDay();
+  const waterOz = typeof raw.waterOz === "number" ? raw.waterOz : raw.water ? WATER_GOAL_OZ : 0;
+  const weight = typeof raw.weight === "number" ? raw.weight : null;
+  return {
+    workout1: !!raw.workout1,
+    workout2: !!raw.workout2,
+    diet: !!raw.diet,
+    reading: !!raw.reading,
+    photo: !!raw.photo,
+    waterOz,
+    weight,
+  };
+}
 
 function makeFreshDays() {
   const arr = {};
@@ -63,7 +86,7 @@ function compressImage(file) {
 
 function isDayComplete(day) {
   if (!day) return false;
-  return TASKS.every((t) => day[t.key]) && day.photo;
+  return TASKS.every((t) => day[t.key]) && (day.waterOz || 0) >= WATER_GOAL_OZ && day.photo;
 }
 
 function consecutiveStreak(days) {
@@ -75,13 +98,54 @@ function consecutiveStreak(days) {
   return streak;
 }
 
+function backwardStreak(days, uptoDay) {
+  let count = 0;
+  for (let i = Math.min(uptoDay, TOTAL_DAYS); i >= 1; i--) {
+    if (isDayComplete(days[i])) count++;
+    else break;
+  }
+  return count;
+}
+
+function totalCompletedCount(days) {
+  let count = 0;
+  for (let i = 1; i <= TOTAL_DAYS; i++) if (isDayComplete(days[i])) count++;
+  return count;
+}
+
+// Finds the first logged weight and the most recent logged weight (up to
+// the active day) to show a simple trend. Returns null until there are at
+// least two distinct days logged.
+function getWeightTrend(days, activeDay) {
+  let firstDay = null;
+  for (let i = 1; i <= TOTAL_DAYS; i++) {
+    if (typeof days[i]?.weight === "number") {
+      firstDay = i;
+      break;
+    }
+  }
+  if (firstDay === null) return null;
+  let latestDay = null;
+  for (let i = Math.min(activeDay, TOTAL_DAYS); i >= 1; i--) {
+    if (typeof days[i]?.weight === "number") {
+      latestDay = i;
+      break;
+    }
+  }
+  if (latestDay === null || latestDay === firstDay) return null;
+  const first = days[firstDay].weight;
+  const latest = days[latestDay].weight;
+  return { firstDay, latestDay, first, latest, diff: Math.round((latest - first) * 10) / 10 };
+}
+
 export default function App() {
   const [days, setDays] = useState(makeFreshDays);
   const [photos, setPhotos] = useState({});
   const [startDate, setStartDate] = useState(null);
+  const [mode, setMode] = useState(null); // "hard" | "soft" | null (not chosen yet)
   const [history, setHistory] = useState([]);
   const [selectedDay, setSelectedDay] = useState(null);
-  const [view, setView] = useState("main"); // main | history | historyDetail
+  const [view, setView] = useState("main"); // main | history | historyDetail | historyCompare | compare
   const [selectedAttempt, setSelectedAttempt] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -89,42 +153,48 @@ export default function App() {
   const [resetNotice, setResetNotice] = useState(null);
   const [installPrompt, setInstallPrompt] = useState(null);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [notifEnabled, setNotifEnabled] = useState(false);
   const fileInputRef = useRef(null);
+  const daysRef = useRef(days);
+  const activeDayRef = useRef(1);
 
-  const persistState = useCallback(async (nextDays, nextStart) => {
-    await storage.setState({ days: nextDays, startDate: nextStart });
+  const showToast = (msg, ms = 2500) => {
+    setToast(msg);
+    setTimeout(() => setToast(""), ms);
+  };
+
+  const persistState = useCallback(async (nextDays, nextStart, nextMode) => {
+    await storage.setState({ days: nextDays, startDate: nextStart, mode: nextMode });
   }, []);
 
   const persistPhotos = useCallback(async (nextPhotos) => {
     const ok = await storage.setPhotos(nextPhotos);
-    if (!ok) {
-      setToast("Photo storage is full on this device");
-      setTimeout(() => setToast(""), 2500);
-    }
+    if (!ok) showToast("Photo storage is full on this device");
   }, []);
 
   const persistHistory = useCallback(async (nextHistory) => {
     const ok = await storage.setHistory(nextHistory);
-    if (!ok) {
-      setToast("Couldn't save history — storage is full");
-      setTimeout(() => setToast(""), 2500);
-    }
+    if (!ok) showToast("Couldn't save history — storage is full");
   }, []);
 
-  // Archive current attempt into history, then reset the board.
+  // Archive current attempt into history, then reset the board. If
+  // endDayOverride is omitted, the attempt is treated as having run the
+  // full 75-day span (used for natural period-end, success or not).
   const archiveAndReset = useCallback(
-    async (currentDays, currentPhotos, currentStart, currentHistory, { completed, failedDay }) => {
+    async (currentDays, currentPhotos, currentStart, currentHistory, currentMode, { completed, endDayOverride }) => {
       const streakReached = consecutiveStreak(currentDays);
-      const endDate = completed
-        ? dateForDay(currentStart, TOTAL_DAYS)
-        : dateForDay(currentStart, failedDay);
+      const totalDone = totalCompletedCount(currentDays);
+      const endDate = endDayOverride
+        ? dateForDay(currentStart, endDayOverride)
+        : dateForDay(currentStart, TOTAL_DAYS);
       const entry = {
         id: Date.now(),
         attemptNumber: currentHistory.length + 1,
         startDate: currentStart,
         endDate,
-        daysCompleted: streakReached,
+        daysCompleted: currentMode === "soft" ? totalDone : streakReached,
         completed: !!completed,
+        mode: currentMode,
         days: currentDays,
         photos: currentPhotos,
       };
@@ -138,7 +208,7 @@ export default function App() {
       setStartDate(today);
 
       await persistHistory(nextHistory);
-      await persistState(freshDays, today);
+      await persistState(freshDays, today, currentMode);
       await persistPhotos({});
 
       return { nextHistory, freshDays, today };
@@ -151,37 +221,66 @@ export default function App() {
       const state = await storage.getState();
       let loadedDays = makeFreshDays();
       let loadedStart = null;
+      let loadedMode = null;
+      let wasFreshInstall = false;
+
       if (state) {
-        loadedDays = { ...loadedDays, ...state.days };
+        if (state.days) {
+          const merged = {};
+          for (let i = 1; i <= TOTAL_DAYS; i++) merged[i] = normalizeDay(state.days[i]);
+          loadedDays = merged;
+        }
         loadedStart = state.startDate || null;
+        loadedMode = state.mode || null;
       }
+
       const p = (await storage.getPhotos()) || {};
       const h = (await storage.getHistory()) || [];
 
       if (!loadedStart) {
         loadedStart = todayStr();
-        await persistState(loadedDays, loadedStart);
+        wasFreshInstall = true;
       }
 
-      // Check whether any past day was left incomplete — if so, the
-      // attempt failed and needs to be archived + reset.
-      const elapsed = elapsedDay(loadedStart);
+      if (!loadedMode) {
+        if (wasFreshInstall) {
+          // True first run — defer everything to the mode picker screen.
+          setDays(loadedDays);
+          setPhotos(p);
+          setStartDate(loadedStart);
+          setHistory(h);
+          setMode(null);
+          setLoaded(true);
+          return;
+        }
+        // Existing attempt from before mode selection existed — default to Hard.
+        loadedMode = "hard";
+      }
+
+      await persistState(loadedDays, loadedStart, loadedMode);
+
+      // Hard mode only: check whether a past day was left incomplete.
       let failedDay = null;
-      for (let i = 1; i <= Math.min(elapsed - 1, TOTAL_DAYS); i++) {
-        if (!isDayComplete(loadedDays[i])) {
-          failedDay = i;
-          break;
+      if (loadedMode === "hard") {
+        const elapsed = elapsedDay(loadedStart);
+        for (let i = 1; i <= Math.min(elapsed - 1, TOTAL_DAYS); i++) {
+          if (!isDayComplete(loadedDays[i])) {
+            failedDay = i;
+            break;
+          }
         }
       }
 
       if (failedDay) {
-        await archiveAndReset(loadedDays, p, loadedStart, h, { failedDay });
+        await archiveAndReset(loadedDays, p, loadedStart, h, loadedMode, { completed: false, endDayOverride: failedDay });
+        setMode(loadedMode);
         setResetNotice(`Day ${failedDay} wasn't finished — that attempt (${failedDay - 1} days) was archived. Starting over at Day 1.`);
       } else {
         setDays(loadedDays);
         setPhotos(p);
         setStartDate(loadedStart);
         setHistory(h);
+        setMode(loadedMode);
       }
       setLoaded(true);
     })();
@@ -199,6 +298,8 @@ export default function App() {
       const dismissed = window.localStorage.getItem("ios-install-dismissed");
       if (!dismissed) setShowInstallBanner(true);
     }
+    const notifPref = window.localStorage.getItem(NOTIF_PREF_KEY);
+    if (notifPref === "1" && getPermissionState() === "granted") setNotifEnabled(true);
     return () => window.removeEventListener("beforeinstallprompt", handler);
   }, []);
 
@@ -216,15 +317,102 @@ export default function App() {
     }
   };
 
-  const streak = consecutiveStreak(days);
+  const totalDone = totalCompletedCount(days);
   const elapsed = startDate ? elapsedDay(startDate) : 1;
   const activeDay = Math.min(Math.max(elapsed, 1), TOTAL_DAYS);
-  const challengeComplete = elapsed > TOTAL_DAYS && streak === TOTAL_DAYS;
+  const displayStreak = mode === "soft" ? backwardStreak(days, activeDay) : consecutiveStreak(days);
+  const periodEnded = elapsed > TOTAL_DAYS;
+  const success = mode === "soft" ? totalDone === TOTAL_DAYS : displayStreak === TOTAL_DAYS;
+  const weightTrend = getWeightTrend(days, activeDay);
+
+  useEffect(() => {
+    daysRef.current = days;
+  }, [days]);
+  useEffect(() => {
+    activeDayRef.current = activeDay;
+  }, [activeDay]);
+
+  // Keep local reminders scheduled for the rest of today whenever enabled,
+  // and reschedule when the app comes back into view (timers don't survive
+  // the tab being fully suspended).
+  useEffect(() => {
+    if (!loaded) return;
+    const doSchedule = () => {
+      if (notifEnabled && getPermissionState() === "granted") {
+        scheduleReminders(() => isDayComplete(daysRef.current[activeDayRef.current]), activeDayRef.current);
+      }
+    };
+    doSchedule();
+    const onVis = () => {
+      if (document.visibilityState === "visible") doSchedule();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [loaded, notifEnabled, activeDay]);
+
+  const toggleNotifications = async () => {
+    if (!notificationsSupported()) {
+      showToast("Notifications aren't supported in this browser");
+      return;
+    }
+    if (notifEnabled) {
+      clearScheduledReminders();
+      setNotifEnabled(false);
+      window.localStorage.setItem(NOTIF_PREF_KEY, "0");
+      showToast("Reminders turned off");
+      return;
+    }
+    const perm = await requestPermission();
+    if (perm === "granted") {
+      setNotifEnabled(true);
+      window.localStorage.setItem(NOTIF_PREF_KEY, "1");
+      showToast("Reminders on — last 4 hours of each day, every 30 min");
+    } else if (perm === "denied") {
+      showToast("Notifications are blocked — enable them in your browser/app settings");
+    }
+  };
+
+  const chooseMode = async (m) => {
+    const today = todayStr();
+    const fresh = makeFreshDays();
+    setMode(m);
+    setDays(fresh);
+    setStartDate(today);
+    await persistState(fresh, today, m);
+  };
+
+  const cycleMode = async () => {
+    const next = mode === "hard" ? "soft" : "hard";
+    setMode(next);
+    await persistState(days, startDate, next);
+    showToast(next === "hard" ? "Switched to Hard — a missed day now resets you" : "Switched to Soft — missed days won't reset your progress");
+  };
 
   const toggleTask = (dayNum, key) => {
     setDays((prev) => {
       const next = { ...prev, [dayNum]: { ...prev[dayNum], [key]: !prev[dayNum][key] } };
-      persistState(next, startDate);
+      persistState(next, startDate, mode);
+      return next;
+    });
+  };
+
+  const adjustWater = (dayNum, delta) => {
+    setDays((prev) => {
+      const cur = prev[dayNum].waterOz || 0;
+      const nextVal = Math.max(0, Math.min(WATER_MAX_OZ, cur + delta));
+      const next = { ...prev, [dayNum]: { ...prev[dayNum], waterOz: nextVal } };
+      persistState(next, startDate, mode);
+      return next;
+    });
+  };
+
+  const setWeight = (dayNum, rawValue) => {
+    const trimmed = rawValue.trim();
+    const parsed = trimmed === "" ? null : parseFloat(trimmed);
+    const clean = parsed !== null && !Number.isNaN(parsed) ? Math.round(parsed * 10) / 10 : null;
+    setDays((prev) => {
+      const next = { ...prev, [dayNum]: { ...prev[dayNum], weight: clean } };
+      persistState(next, startDate, mode);
       return next;
     });
   };
@@ -241,12 +429,11 @@ export default function App() {
       await persistPhotos(nextPhotos);
       setDays((prev) => {
         const next = { ...prev, [selectedDay]: { ...prev[selectedDay], photo: true } };
-        persistState(next, startDate);
+        persistState(next, startDate, mode);
         return next;
       });
     } catch (err) {
-      setToast("Couldn't process that photo");
-      setTimeout(() => setToast(""), 2000);
+      showToast("Couldn't process that photo");
     }
     e.target.value = "";
   };
@@ -258,19 +445,42 @@ export default function App() {
     persistPhotos(nextPhotos);
     setDays((prev) => {
       const next = { ...prev, [selectedDay]: { ...prev[selectedDay], photo: false } };
-      persistState(next, startDate);
+      persistState(next, startDate, mode);
       return next;
     });
   };
 
-  const startNewAfterCompletion = async () => {
-    await archiveAndReset(days, photos, startDate, history, { completed: true });
+  const startNewAttempt = async () => {
+    await archiveAndReset(days, photos, startDate, history, mode, { completed: success });
   };
 
   if (!loaded) {
     return (
       <div style={{ ...styles.app, alignItems: "center", justifyContent: "center" }}>
         <div style={{ color: COLORS.muted, fontFamily: FONT.mono, letterSpacing: 2 }}>LOADING…</div>
+      </div>
+    );
+  }
+
+  // ---------- Mode picker (first run only) ----------
+  if (mode === null) {
+    return (
+      <div style={styles.app}>
+        <div style={styles.eyebrow}>CHOOSE YOUR CHALLENGE</div>
+        <h1 style={styles.title}>75 HARD</h1>
+        <div style={{ display: "flex", flexDirection: "column", gap: 14, marginTop: 28, flex: 1, justifyContent: "center" }}>
+          <button onClick={() => chooseMode("hard")} style={styles.modeCard}>
+            <div style={styles.modeCardTitle}>HARD</div>
+            <div style={styles.modeCardDesc}>Miss any task on any day and the board resets to Day 1. No exceptions — the original rule.</div>
+          </button>
+          <button onClick={() => chooseMode("soft")} style={styles.modeCard}>
+            <div style={styles.modeCardTitle}>SOFT</div>
+            <div style={styles.modeCardDesc}>Missed days just stay incomplete. Your progress is never wiped — track at your own pace.</div>
+          </button>
+        </div>
+        <div style={{ fontFamily: FONT.mono, fontSize: 10, color: COLORS.muted, letterSpacing: 1, marginTop: 12 }}>
+          YOU CAN SWITCH MODES LATER FROM THE MAIN SCREEN
+        </div>
       </div>
     );
   }
@@ -306,6 +516,7 @@ export default function App() {
                 <div>
                   <div style={styles.historyCardTitle}>
                     ATTEMPT #{a.attemptNumber}
+                    <span style={styles.historyModeTag}>{(a.mode || "hard").toUpperCase()}</span>
                     {a.completed && <Trophy size={14} color={COLORS.accent2} style={{ marginLeft: 6, verticalAlign: "-2px" }} />}
                   </div>
                   <div style={styles.historyCardDates}>
@@ -313,12 +524,7 @@ export default function App() {
                   </div>
                 </div>
                 <div style={{ textAlign: "right" }}>
-                  <div
-                    style={{
-                      ...styles.historyCardDays,
-                      color: a.completed ? COLORS.accent2 : COLORS.text,
-                    }}
-                  >
+                  <div style={{ ...styles.historyCardDays, color: a.completed ? COLORS.accent2 : COLORS.text }}>
                     {a.daysCompleted}/{TOTAL_DAYS}
                   </div>
                   <div style={styles.historyCardLabel}>{a.completed ? "COMPLETE" : "DAYS"}</div>
@@ -342,6 +548,12 @@ export default function App() {
             <ChevronLeft size={18} strokeWidth={2.5} />
             <span>ALL ATTEMPTS</span>
           </button>
+          {dayNums.length >= 2 && (
+            <button onClick={() => setView("historyCompare")} style={styles.compareTextBtn}>
+              <Images size={14} strokeWidth={1.75} />
+              <span>COMPARE</span>
+            </button>
+          )}
         </div>
         <h1 style={styles.dayTitle}>ATTEMPT #{a.attemptNumber}</h1>
         <div style={{ color: COLORS.muted, fontFamily: FONT.mono, fontSize: 12, marginTop: 6, marginBottom: 20 }}>
@@ -363,11 +575,87 @@ export default function App() {
     );
   }
 
+  // ---------- History compare ----------
+  if (view === "historyCompare" && selectedAttempt) {
+    const a = selectedAttempt;
+    const dayNums = Object.keys(a.photos || {}).map(Number).sort((x, y) => x - y);
+    const firstDay = dayNums[0];
+    const lastDay = dayNums[dayNums.length - 1];
+    return (
+      <div style={styles.app}>
+        <div style={styles.detailHeader}>
+          <button onClick={() => setView("historyDetail")} style={styles.backBtn}>
+            <ChevronLeft size={18} strokeWidth={2.5} />
+            <span>ATTEMPT #{a.attemptNumber}</span>
+          </button>
+        </div>
+        <h1 style={styles.dayTitle}>COMPARE</h1>
+        <div style={styles.compareRow}>
+          <div style={styles.compareCol}>
+            <img src={a.photos[firstDay]} alt={`Day ${firstDay}`} style={styles.comparePhoto} />
+            <div style={styles.compareLabel}>DAY {firstDay}</div>
+          </div>
+          <div style={styles.compareCol}>
+            <img src={a.photos[lastDay]} alt={`Day ${lastDay}`} style={styles.comparePhoto} />
+            <div style={styles.compareLabel}>DAY {lastDay}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---------- Current attempt compare ----------
+  if (view === "compare") {
+    const day1Photo = photos[1];
+    let latestDay = null;
+    for (let i = Math.min(activeDay, TOTAL_DAYS); i >= 1; i--) {
+      if (photos[i]) {
+        latestDay = i;
+        break;
+      }
+    }
+    const otherDay = latestDay && latestDay !== 1 ? latestDay : null;
+    return (
+      <div style={styles.app}>
+        <div style={styles.detailHeader}>
+          <button onClick={() => setView("main")} style={styles.backBtn}>
+            <ChevronLeft size={18} strokeWidth={2.5} />
+            <span>BACK</span>
+          </button>
+        </div>
+        <h1 style={styles.dayTitle}>COMPARE</h1>
+        <div style={styles.compareRow}>
+          <div style={styles.compareCol}>
+            {day1Photo ? (
+              <img src={day1Photo} alt="Day 1" style={styles.comparePhoto} />
+            ) : (
+              <div style={styles.comparePlaceholder}>No Day 1 photo yet</div>
+            )}
+            <div style={styles.compareLabel}>DAY 1</div>
+          </div>
+          <div style={styles.compareCol}>
+            {otherDay ? (
+              <>
+                <img src={photos[otherDay]} alt={`Day ${otherDay}`} style={styles.comparePhoto} />
+                <div style={styles.compareLabel}>DAY {otherDay}</div>
+              </>
+            ) : (
+              <div style={styles.comparePlaceholder}>Add more day photos to compare</div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ---------- Day detail ----------
   if (selectedDay) {
     const day = days[selectedDay];
     const complete = isDayComplete(day);
     const dateLabel = startDate ? formatDisplayDate(dateForDay(startDate, selectedDay)) : "";
+    const waterOz = day.waterOz || 0;
+    const waterPct = Math.min(100, Math.round((waterOz / WATER_GOAL_OZ) * 100));
+    const waterDone = waterOz >= WATER_GOAL_OZ;
     return (
       <div style={styles.app}>
         <input ref={fileInputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} />
@@ -395,7 +683,7 @@ export default function App() {
           </div>
 
           <div style={styles.taskList}>
-            {TASKS.map((t) => {
+            {TASKS.slice(0, 3).map((t) => {
               const Icon = t.icon;
               const checked = day[t.key];
               return (
@@ -410,12 +698,77 @@ export default function App() {
                     {checked && <Check size={14} color="#16171A" strokeWidth={3} />}
                   </div>
                   <Icon size={18} color={checked ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
-                  <span style={{ ...styles.taskLabel, color: checked ? COLORS.text : COLORS.muted }}>
-                    {t.label}
-                  </span>
+                  <span style={{ ...styles.taskLabel, color: checked ? COLORS.text : COLORS.muted }}>{t.label}</span>
                 </button>
               );
             })}
+
+            <div style={styles.waterCard}>
+              <div style={styles.waterHeader}>
+                <Droplets size={18} color={waterDone ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+                <span style={{ ...styles.taskLabel, color: waterDone ? COLORS.text : COLORS.muted, flex: 1 }}>Water</span>
+                <span style={styles.waterValue}>
+                  {waterOz} / {WATER_GOAL_OZ} oz
+                </span>
+              </div>
+              <div style={styles.waterBarTrack}>
+                <div style={{ ...styles.waterBarFill, width: `${waterPct}%`, background: waterDone ? COLORS.accent : COLORS.accent2 }} />
+              </div>
+              <div style={styles.waterButtons}>
+                <button onClick={() => adjustWater(selectedDay, -8)} style={styles.waterBtn}>
+                  <Minus size={12} strokeWidth={2.5} />
+                  <span>8oz</span>
+                </button>
+                <button onClick={() => adjustWater(selectedDay, 8)} style={styles.waterBtn}>
+                  <Plus size={12} strokeWidth={2.5} />
+                  <span>8oz</span>
+                </button>
+                <button onClick={() => adjustWater(selectedDay, 16)} style={styles.waterBtn}>
+                  <Plus size={12} strokeWidth={2.5} />
+                  <span>16oz</span>
+                </button>
+                <button onClick={() => adjustWater(selectedDay, 32)} style={styles.waterBtn}>
+                  <Plus size={12} strokeWidth={2.5} />
+                  <span>32oz</span>
+                </button>
+              </div>
+            </div>
+
+            {TASKS.slice(3).map((t) => {
+              const Icon = t.icon;
+              const checked = day[t.key];
+              return (
+                <button key={t.key} onClick={() => toggleTask(selectedDay, t.key)} style={styles.taskRow}>
+                  <div
+                    style={{
+                      ...styles.taskCheck,
+                      background: checked ? COLORS.accent : "transparent",
+                      borderColor: checked ? COLORS.accent : COLORS.line,
+                    }}
+                  >
+                    {checked && <Check size={14} color="#16171A" strokeWidth={3} />}
+                  </div>
+                  <Icon size={18} color={checked ? COLORS.text : COLORS.muted} strokeWidth={1.75} />
+                  <span style={{ ...styles.taskLabel, color: checked ? COLORS.text : COLORS.muted }}>{t.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div style={styles.weightSection}>
+            <div style={styles.photoLabel}>BODY WEIGHT (OPTIONAL)</div>
+            <div style={styles.weightRow}>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.1"
+                placeholder="—"
+                value={day.weight === null || day.weight === undefined ? "" : day.weight}
+                onChange={(e) => setWeight(selectedDay, e.target.value)}
+                style={styles.weightInput}
+              />
+              <span style={styles.weightUnit}>lb</span>
+            </div>
           </div>
 
           <div style={styles.photoSection}>
@@ -453,13 +806,17 @@ export default function App() {
         </div>
       )}
 
-      {challengeComplete && (
-        <div style={styles.completeBanner}>
+      {periodEnded && (
+        <div style={{ ...styles.completeBanner, borderColor: success ? COLORS.accent2 : COLORS.line }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <Trophy size={18} color={COLORS.accent2} />
-            <span style={{ fontSize: 13, color: COLORS.text, fontWeight: 600 }}>75 Hard complete. All 75 days locked in.</span>
+            {success && <Trophy size={18} color={COLORS.accent2} />}
+            <span style={{ fontSize: 13, color: COLORS.text, fontWeight: 600 }}>
+              {success
+                ? `75 ${mode === "soft" ? "Soft" : "Hard"} complete. All 75 days locked in.`
+                : `Challenge period ended — ${totalDone}/75 days completed.`}
+            </span>
           </div>
-          <button onClick={startNewAfterCompletion} style={styles.installBtn}>NEW ATTEMPT</button>
+          <button onClick={startNewAttempt} style={styles.installBtn}>NEW ATTEMPT</button>
         </div>
       )}
 
@@ -468,15 +825,11 @@ export default function App() {
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             {isIos() ? <Share size={16} color={COLORS.accent2} /> : <Download size={16} color={COLORS.accent2} />}
             <span style={{ fontSize: 12.5, color: COLORS.text }}>
-              {isIos()
-                ? "Tap Share, then \u201cAdd to Home Screen\u201d to install"
-                : "Install this app for offline access"}
+              {isIos() ? "Tap Share, then \u201cAdd to Home Screen\u201d to install" : "Install this app for offline access"}
             </span>
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            {!isIos() && (
-              <button onClick={runInstall} style={styles.installBtn}>INSTALL</button>
-            )}
+            {!isIos() && <button onClick={runInstall} style={styles.installBtn}>INSTALL</button>}
             <button onClick={dismissBanner} style={styles.installDismiss}>
               <X size={14} color={COLORS.muted} />
             </button>
@@ -489,31 +842,48 @@ export default function App() {
           <div style={styles.eyebrow}>NO EXCUSES · NO SUBSTITUTIONS</div>
           <h1 style={styles.title}>75 HARD</h1>
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <button onClick={() => setView("history")} style={styles.historyBtn}>
-            <HistoryIcon size={18} color={COLORS.muted} strokeWidth={1.75} />
-          </button>
-          <div style={styles.streakBox}>
-            <div style={styles.streakNum}>{String(streak).padStart(2, "0")}</div>
-            <div style={styles.streakLabel}>STREAK</div>
-          </div>
+        <div style={styles.streakBox}>
+          <div style={styles.streakNum}>{String(displayStreak).padStart(2, "0")}</div>
+          <div style={styles.streakLabel}>STREAK</div>
         </div>
       </div>
 
+      <div style={styles.toolbar}>
+        <button onClick={cycleMode} style={styles.modePill}>
+          {mode.toUpperCase()}
+        </button>
+        <div style={{ flex: 1 }} />
+        <button onClick={() => setView("compare")} style={styles.toolbarIconBtn}>
+          <Images size={16} color={COLORS.muted} strokeWidth={1.75} />
+        </button>
+        <button onClick={toggleNotifications} style={styles.toolbarIconBtn}>
+          {notifEnabled ? <Bell size={16} color={COLORS.accent2} strokeWidth={1.75} /> : <BellOff size={16} color={COLORS.muted} strokeWidth={1.75} />}
+        </button>
+        <button onClick={() => setView("history")} style={styles.toolbarIconBtn}>
+          <HistoryIcon size={16} color={COLORS.muted} strokeWidth={1.75} />
+        </button>
+      </div>
+
       <div style={styles.progressBar}>
-        <div style={{ ...styles.progressFill, width: `${(streak / TOTAL_DAYS) * 100}%` }} />
+        <div style={{ ...styles.progressFill, width: `${(displayStreak / TOTAL_DAYS) * 100}%` }} />
       </div>
       <div style={styles.progressText}>
-        {streak} of {TOTAL_DAYS} days complete · Day {activeDay} of {TOTAL_DAYS} today
+        {mode === "soft" ? `${totalDone} of ${TOTAL_DAYS} total · ${displayStreak}-day streak` : `${displayStreak} of ${TOTAL_DAYS} days complete`} · Day {activeDay} today
       </div>
+      {weightTrend && (
+        <div style={styles.weightTrendText}>
+          {weightTrend.latest} lb ({weightTrend.diff > 0 ? "+" : ""}
+          {weightTrend.diff} lb since Day {weightTrend.firstDay})
+        </div>
+      )}
 
       <div style={styles.grid}>
         {Array.from({ length: TOTAL_DAYS }, (_, i) => i + 1).map((n) => {
           const day = days[n];
           const complete = isDayComplete(day);
-          const isActive = n === activeDay && !challengeComplete;
+          const isActive = n === activeDay && !periodEnded;
           const isFuture = n > activeDay;
-          const anyProgress = TASKS.some((t) => day[t.key]) || day.photo;
+          const anyProgress = TASKS.some((t) => day[t.key]) || day.photo || (day.waterOz || 0) > 0;
           return (
             <button
               key={n}
@@ -543,11 +913,13 @@ export default function App() {
           </button>
         ) : (
           <div style={styles.confirmBox}>
-            <span style={{ color: COLORS.text, fontSize: 13 }}>Wipe current progress and start over at Day 1? This attempt will be saved to history.</span>
+            <span style={{ color: COLORS.text, fontSize: 13 }}>
+              Wipe current progress and start over at Day 1? This attempt will be saved to history.
+            </span>
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={async () => {
-                  await archiveAndReset(days, photos, startDate, history, { failedDay: activeDay });
+                  await archiveAndReset(days, photos, startDate, history, mode, { completed: false, endDayOverride: activeDay });
                   setConfirmReset(false);
                 }}
                 style={styles.confirmYes}
@@ -619,7 +991,7 @@ const styles = {
     justifyContent: "space-between",
     gap: 10,
     background: COLORS.panel,
-    border: `1px solid ${COLORS.accent2}`,
+    border: "1px solid",
     borderRadius: 6,
     padding: "10px 12px",
     marginBottom: 16,
@@ -649,7 +1021,35 @@ const styles = {
     display: "flex",
     justifyContent: "space-between",
     alignItems: "flex-end",
-    marginBottom: 18,
+    marginBottom: 12,
+  },
+  toolbar: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 16,
+  },
+  modePill: {
+    background: "transparent",
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 20,
+    padding: "6px 12px",
+    color: COLORS.accent2,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1.5,
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  toolbarIconBtn: {
+    background: "transparent",
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 4,
+    padding: "8px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
   },
   eyebrow: {
     fontFamily: FONT.mono,
@@ -665,16 +1065,6 @@ const styles = {
     letterSpacing: 1,
     color: COLORS.text,
     margin: 0,
-  },
-  historyBtn: {
-    background: "transparent",
-    border: `1px solid ${COLORS.line}`,
-    borderRadius: 4,
-    padding: "10px",
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: "pointer",
   },
   streakBox: {
     textAlign: "right",
@@ -713,6 +1103,13 @@ const styles = {
     fontSize: 11,
     color: COLORS.muted,
     marginTop: 6,
+    marginBottom: 20,
+  },
+  weightTrendText: {
+    fontFamily: FONT.mono,
+    fontSize: 11,
+    color: COLORS.accent2,
+    marginTop: -14,
     marginBottom: 20,
   },
   grid: {
@@ -798,6 +1195,8 @@ const styles = {
     borderRadius: 4,
     fontSize: 13,
     fontFamily: FONT.body,
+    maxWidth: "85%",
+    textAlign: "center",
   },
   detailHeader: {
     display: "flex",
@@ -817,6 +1216,20 @@ const styles = {
     letterSpacing: 1,
     cursor: "pointer",
     padding: 0,
+  },
+  compareTextBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 5,
+    background: "transparent",
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 4,
+    padding: "5px 10px",
+    color: COLORS.muted,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1,
+    cursor: "pointer",
   },
   detailBody: {
     display: "flex",
@@ -871,6 +1284,81 @@ const styles = {
     fontSize: 14,
     fontFamily: FONT.body,
     fontWeight: 500,
+  },
+  waterCard: {
+    padding: "14px 12px",
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 6,
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  waterHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+  },
+  waterValue: {
+    fontFamily: FONT.mono,
+    fontSize: 11,
+    color: COLORS.muted,
+  },
+  waterBarTrack: {
+    height: 6,
+    background: COLORS.bg,
+    borderRadius: 3,
+    overflow: "hidden",
+  },
+  waterBarFill: {
+    height: "100%",
+    transition: "width 0.2s ease",
+  },
+  waterButtons: {
+    display: "flex",
+    gap: 6,
+  },
+  waterBtn: {
+    flex: 1,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 3,
+    padding: "8px 4px",
+    background: COLORS.bg,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 4,
+    color: COLORS.text,
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    cursor: "pointer",
+  },
+  weightSection: {
+    marginTop: 4,
+  },
+  weightRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 6,
+    padding: "10px 14px",
+  },
+  weightInput: {
+    flex: 1,
+    background: "transparent",
+    border: "none",
+    outline: "none",
+    color: COLORS.text,
+    fontFamily: FONT.display,
+    fontSize: 22,
+    fontWeight: 600,
+  },
+  weightUnit: {
+    fontFamily: FONT.mono,
+    fontSize: 12,
+    color: COLORS.muted,
   },
   photoSection: {
     marginTop: 4,
@@ -939,6 +1427,16 @@ const styles = {
     letterSpacing: 1,
     color: COLORS.text,
   },
+  historyModeTag: {
+    fontFamily: FONT.mono,
+    fontSize: 9,
+    letterSpacing: 1,
+    color: COLORS.muted,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 3,
+    padding: "1px 5px",
+    marginLeft: 8,
+  },
   historyCardDates: {
     fontFamily: FONT.body,
     fontSize: 12,
@@ -984,5 +1482,64 @@ const styles = {
     fontSize: 9,
     padding: "2px 5px",
     borderRadius: 3,
+  },
+  compareRow: {
+    display: "flex",
+    gap: 12,
+  },
+  compareCol: {
+    flex: 1,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 8,
+  },
+  comparePhoto: {
+    width: "100%",
+    aspectRatio: "3/4",
+    objectFit: "cover",
+    borderRadius: 6,
+    border: `1px solid ${COLORS.line}`,
+  },
+  comparePlaceholder: {
+    width: "100%",
+    aspectRatio: "3/4",
+    borderRadius: 6,
+    border: `1.5px dashed ${COLORS.line}`,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    textAlign: "center",
+    color: COLORS.muted,
+    fontSize: 12,
+    padding: 12,
+  },
+  compareLabel: {
+    fontFamily: FONT.mono,
+    fontSize: 10,
+    letterSpacing: 1.5,
+    color: COLORS.muted,
+  },
+  modeCard: {
+    padding: 18,
+    background: COLORS.panel,
+    border: `1px solid ${COLORS.line}`,
+    borderRadius: 8,
+    textAlign: "left",
+    cursor: "pointer",
+  },
+  modeCardTitle: {
+    fontFamily: FONT.display,
+    fontSize: 22,
+    fontWeight: 700,
+    color: COLORS.accent2,
+    letterSpacing: 1,
+    marginBottom: 6,
+  },
+  modeCardDesc: {
+    fontFamily: FONT.body,
+    fontSize: 13,
+    color: COLORS.muted,
+    lineHeight: 1.5,
   },
 };
